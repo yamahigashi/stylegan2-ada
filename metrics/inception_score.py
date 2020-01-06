@@ -14,6 +14,7 @@ import numpy as np
 import tensorflow as tf
 import dnnlib
 import dnnlib.tflib as tflib
+import tflex
 
 from metrics import metric_base
 
@@ -35,7 +36,7 @@ class IS(metric_base.MetricBase):
         # Construct TensorFlow graph.
         result_expr = []
         for gpu_idx in range(num_gpus):
-            with tf.device(f'/gpu:{gpu_idx}'):
+            with tflex.device(f'/gpu:{gpu_idx}'):
                 Gs_clone = Gs.clone()
                 inception_clone = inception.clone()
                 latents = tf.random_normal([self.minibatch_per_gpu] + Gs_clone.input_shape[1:])

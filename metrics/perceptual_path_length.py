@@ -14,6 +14,7 @@ import numpy as np
 import tensorflow as tf
 import dnnlib
 import dnnlib.tflib as tflib
+import tflex
 
 from metrics import metric_base
 
@@ -53,7 +54,7 @@ class PPL(metric_base.MetricBase):
         # Construct TensorFlow graph.
         distance_expr = []
         for gpu_idx in range(num_gpus):
-            with tf.device(f'/gpu:{gpu_idx}'):
+            with tflex.device(f'/gpu:{gpu_idx}'):
                 Gs_clone = Gs.clone()
                 noise_vars = [var for name, var in Gs_clone.components.synthesis.vars.items() if name.startswith('noise')]
 

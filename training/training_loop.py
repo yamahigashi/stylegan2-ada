@@ -14,6 +14,7 @@ import time
 import PIL.Image
 import numpy as np
 import tensorflow as tf
+import tflex
 import dnnlib
 import dnnlib.tflib as tflib
 from dnnlib.tflib.autosummary import autosummary
@@ -103,9 +104,15 @@ def training_loop(
     kimg_per_tick           = 4,        # Progress snapshot interval.
     image_snapshot_ticks    = 50,       # How often to save image snapshots? None = only save 'reals.png' and 'fakes-init.png'.
     network_snapshot_ticks  = 50,       # How often to save network snapshots? None = only save 'networks-final.pkl'.
-    resume_pkl              = None,     # Network pickle to resume training from.
     abort_fn                = None,     # Callback function for determining whether to abort training.
     progress_fn             = None,     # Callback function for updating training progress.
+
+    save_tf_graph           = False,    # Include full TensorFlow computation graph in the tfevents file?
+    save_weight_histograms  = False,    # Include weight histograms in the tfevents file?
+    resume_pkl              = None,     # Network pickle to resume training from, None = train from scratch.
+    resume_kimg             = 0.0,      # Assumed training progress at the beginning. Affects reporting and training schedule.
+    resume_time             = 0.0,      # Assumed wallclock time at the beginning. Affects reporting.
+    resume_with_new_nets    = False):   # Construct new networks according to G_args and D_args before resuming training?
 ):
     assert minibatch_size % (num_gpus * minibatch_gpu) == 0
     start_time = time.time()
@@ -116,11 +123,13 @@ def training_loop(
     print('Label shape:', [training_set.label_size])
     print()
 
-    print('Constructing networks...')
-    with tf.device('/gpu:0'):
-        G = tflib.Network('G', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size, **G_args)
-        D = tflib.Network('D', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size, **D_args)
-        Gs = G.clone('Gs')
+    with tflex.device('/gpu:0'):
+        if resume_pkl is None or resume_with_new_nets:
+            print('Constructing networks...')
+            G = tflib.Network('G', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size, **G_args)
+            D = tflib.Network('D', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size, **D_args)
+            Gs = G.clone('Gs')
+
         if resume_pkl is not None:
             print(f'Resuming from "{resume_pkl}"')
             with dnnlib.util.open_url(resume_pkl) as f:
@@ -171,7 +180,7 @@ def training_loop(
     data_fetch_ops = []
     training_set.configure(minibatch_gpu)
     for gpu, (G_gpu, D_gpu) in enumerate(zip(G_gpus, D_gpus)):
-        with tf.name_scope(f'Train_gpu{gpu}'), tf.device(f'/gpu:{gpu}'):
+        with tf.name_scope(f'Train_gpu{gpu}'), tflex.device(f'/gpu:{gpu}'):
 
             # Fetch training data via temporary variables.
             with tf.name_scope('DataFetch'):
@@ -202,9 +211,18 @@ def training_loop(
     D_reg_op = D_reg_opt.apply_updates(allow_no_op=True)
     Gs_beta_in = tf.placeholder(tf.float32, name='Gs_beta_in', shape=[])
     Gs_update_op = Gs.setup_as_moving_average_of(G, beta=Gs_beta_in)
+
+
     tflib.init_uninitialized_vars()
-    with tf.device('/gpu:0'):
-        peak_gpu_mem_op = tf.contrib.memory_stats.MaxBytesInUse()
+    # Finalize graph.
+    if tflex.has_gpu():
+        with tflex.device('/gpu:0'):
+            try:
+                peak_gpu_mem_op = tf.contrib.memory_stats.MaxBytesInUse()
+            except tf.errors.NotFoundError:
+                peak_gpu_mem_op = tf.constant(0)
+    else:
+        peak_gpu_mem_op = None
 
     print('Initializing metrics...')
     summary_log = tf.summary.FileWriter(run_dir)
