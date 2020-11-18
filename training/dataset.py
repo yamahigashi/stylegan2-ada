@@ -9,13 +9,16 @@
 """Streaming images and labels from dataset created with dataset_tool.py."""
 
 import os
-import glob
 import numpy as np
 import tensorflow as tf
+
+from tensorflow.python.platform import gfile
+from tensorflow.python.framework import errors_impl
 
 import tflex
 import dnnlib
 import dnnlib.tflib as tflib
+
 
 #----------------------------------------------------------------------------
 # Dataset class that loads images from tfrecords files.
@@ -62,8 +65,8 @@ class TFRecordDataset:
         self._cur_lod           = -1
 
         # List files in the dataset directory.
-        assert os.path.isdir(self.tfrecord_dir)
-        all_files = sorted(glob.glob(os.path.join(self.tfrecord_dir, '*')))
+        assert gfile.IsDirectory(self.tfrecord_dir)
+        all_files = sorted(tf.io.gfile.glob(os.path.join(self.tfrecord_dir, '*')))
         self.has_validation_set = (self._max_validation > 0) and any(os.path.basename(f).startswith('validation-') for f in all_files)
         all_files = [f for f in all_files if os.path.basename(f).startswith('validation-') == _is_validation]
 
@@ -79,12 +82,12 @@ class TFRecordDataset:
 
         # Autodetect label filename.
         if self.label_file is None:
-            guess = [f for f in all_files if f.endswith('.labels')]
+            guess = sorted(tf.io.gfile.glob(os.path.join(self.tfrecord_dir, '*.labels')))
             if len(guess):
                 self.label_file = guess[0]
-        elif not os.path.isfile(self.label_file):
+        elif not tf.io.gfile.exists(self.label_file):
             guess = os.path.join(self.tfrecord_dir, self.label_file)
-            if os.path.isfile(guess):
+            if tf.io.gfile.exists(guess):
                 self.label_file = guess
 
         # Determine shape and resolution.
@@ -102,7 +105,8 @@ class TFRecordDataset:
         assert max_label_size == 'full' or max_label_size >= 0
         self._np_labels = np.zeros([1<<30, 0], dtype=np.float32)
         if self.label_file is not None and max_label_size != 0:
-            self._np_labels = np.load(self.label_file)
+            with gfile.GFile(self.label_file, 'rb') as f:
+                self._np_labels = np.load(f)
             assert self._np_labels.ndim == 2
         if max_label_size != 'full' and self._np_labels.shape[1] > max_label_size:
             self._np_labels = self._np_labels[:, :max_label_size]
@@ -112,8 +116,7 @@ class TFRecordDataset:
         self.label_dtype = self._np_labels.dtype.name
 
         # Build TF expressions.
-        # with tf.name_scope('Dataset'), tf.device('/cpu:0'), tf.control_dependencies(None):
-        with tf.name_scope('Dataset'), tflex.device('/cpu:0') tf.control_dependencies(None):
+        with tf.name_scope('Dataset'), tflex.device('/cpu:0'), tf.control_dependencies(None):
             self._tf_minibatch_in = tf.placeholder(tf.int64, name='minibatch_in', shape=[])
             self._tf_labels_var = tflib.create_var_with_large_initial_value(self._np_labels, name='labels_var')
             self._tf_labels_dataset = tf.data.Dataset.from_tensor_slices(self._tf_labels_var)
@@ -159,18 +162,22 @@ class TFRecordDataset:
         return images, labels
 
     # Get next minibatch as NumPy arrays.
-    def get_minibatch_np(self, minibatch_size, lod=0): # => (images, labels) or (None, None)
-        self.configure(minibatch_size, lod)
-        if self._tf_minibatch_np is None:
-            with tf.name_scope('Dataset'):
-                self._tf_minibatch_np = self.get_minibatch_tf()
-        try:
-            return tflib.run(self._tf_minibatch_np)
-        except tf.errors.OutOfRangeError:
-            return None, None
+    def get_minibatch_np(self, minibatch_size, lod=0):  # => (images, labels) or (None, None)
+        while True:
+            self.configure(minibatch_size, lod)
+            if self._tf_minibatch_np is None:
+                with tf.name_scope('Dataset'):
+                    self._tf_minibatch_np = self.get_minibatch_tf()
+            try:
+                return tflib.run(self._tf_minibatch_np)
+            except errors_impl.AbortedError:
+                import traceback
+                traceback.print_exc()
+            except tf.errors.OutOfRangeError:
+                return None, None
 
     # Get random labels as TensorFlow expression.
-    def get_random_labels_tf(self, minibatch_size): # => labels
+    def get_random_labels_tf(self, minibatch_size):  # => labels
         with tf.name_scope('Dataset'):
             if self.label_size > 0:
                 with tflex.device('/cpu:0'):
@@ -178,7 +185,7 @@ class TFRecordDataset:
             return tf.zeros([minibatch_size, 0], self.label_dtype)
 
     # Get random labels as NumPy array.
-    def get_random_labels_np(self, minibatch_size): # => labels
+    def get_random_labels_np(self, minibatch_size)#  => labels
         if self.label_size > 0:
             return self._np_labels[np.random.randint(self._np_labels.shape[0], size=[minibatch_size])]
         return np.zeros([minibatch_size, 0], self.label_dtype)
@@ -213,6 +220,12 @@ class TFRecordDataset:
             'data': tf.FixedLenFeature([], tf.string)})
         data = tf.decode_raw(features['data'], tf.uint8)
         return tf.reshape(data, features['shape'])
+
+    # Parse individual image from a tfrecords file into TensorFlow expression.
+    @staticmethod
+    def parse_tfrecord_tf_float(record):
+        img = TFRecordDataset.parse_tfrecord_tf(record)
+        return tf.cast(img, dtype=tf.float32)
 
     # Parse individual image from a tfrecords file into NumPy array.
     @staticmethod
